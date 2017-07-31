@@ -31,9 +31,9 @@ var inputValueTracking = require('inputValueTracking');
 var isCustomComponent = require('isCustomComponent');
 var setInnerHTML = require('setInnerHTML');
 var setTextContent = require('setTextContent');
-var warning = require('fbjs/lib/warning');
 
 if (__DEV__) {
+  var warning = require('fbjs/lib/warning');
   var ReactDOMInvalidARIAHook = require('ReactDOMInvalidARIAHook');
   var ReactDOMNullInputValuePropHook = require('ReactDOMNullInputValuePropHook');
   var ReactDOMUnknownPropertyHook = require('ReactDOMUnknownPropertyHook');
@@ -46,6 +46,7 @@ if (__DEV__) {
   } = ReactDOMUnknownPropertyHook;
 }
 
+var didWarnInvalidHydration = false;
 var didWarnShadyDOM = false;
 
 var listenTo = ReactBrowserEventEmitter.listenTo;
@@ -64,10 +65,78 @@ var {
 } = DOMNamespaces;
 
 if (__DEV__) {
+  var warnedUnknownTags = {
+    // Chrome is the only major browser not shipping <time>. But as of July
+    // 2017 it intends to ship it due to widespread usage. We intentionally
+    // *don't* warn for <time> even if it's unrecognized by Chrome because
+    // it soon will be, and many apps have been using it anyway.
+    time: true,
+  };
+
   var validatePropertiesInDevelopment = function(type, props) {
     validateARIAProperties(type, props);
     validateInputPropertes(type, props);
     validateUnknownPropertes(type, props);
+  };
+
+  var warnForTextDifference = function(serverText: string, clientText: string) {
+    if (didWarnInvalidHydration) {
+      return;
+    }
+    didWarnInvalidHydration = true;
+    warning(
+      false,
+      'Text content did not match. Server: "%s" Client: "%s"',
+      serverText,
+      clientText,
+    );
+  };
+
+  var warnForPropDifference = function(
+    propName: string,
+    serverValue: mixed,
+    clientValue: mixed,
+  ) {
+    if (didWarnInvalidHydration) {
+      return;
+    }
+    didWarnInvalidHydration = true;
+    warning(
+      false,
+      'Prop `%s` did not match. Server: %s Client: %s',
+      propName,
+      JSON.stringify(serverValue),
+      JSON.stringify(clientValue),
+    );
+  };
+
+  var warnForExtraAttributes = function(attributeNames: Set<string>) {
+    if (didWarnInvalidHydration) {
+      return;
+    }
+    didWarnInvalidHydration = true;
+    var names = [];
+    attributeNames.forEach(function(name) {
+      names.push(name);
+    });
+    warning(false, 'Extra attributes from the server: %s', names);
+  };
+
+  var testDocument;
+  // Parse the HTML and read it back to normalize the HTML string so that it
+  // can be used for comparison.
+  var normalizeHTML = function(parent: Element, html: string) {
+    if (!testDocument) {
+      testDocument = document.implementation.createHTMLDocument();
+    }
+    var testElement = parent.namespaceURI === HTML_NAMESPACE
+      ? testDocument.createElement(parent.tagName)
+      : testDocument.createElementNS(
+          (parent.namespaceURI: any),
+          parent.tagName,
+        );
+    testElement.innerHTML = html;
+    return testElement.innerHTML;
   };
 }
 
@@ -305,15 +374,21 @@ var ReactDOMFiberComponent = {
 
     if (__DEV__) {
       if (namespaceURI === HTML_NAMESPACE) {
-        warning(
-          isCustomComponentTag ||
-            Object.prototype.toString.call(domElement) !==
-              '[object HTMLUnknownElement]',
-          'The tag <%s> is unrecognized in this browser. ' +
-            'If you meant to render a React component, start its name with ' +
-            'an uppercase letter.',
-          type,
-        );
+        if (
+          !isCustomComponentTag &&
+          Object.prototype.toString.call(domElement) ===
+            '[object HTMLUnknownElement]' &&
+          !Object.prototype.hasOwnProperty.call(warnedUnknownTags, type)
+        ) {
+          warnedUnknownTags[type] = true;
+          warning(
+            false,
+            'The tag <%s> is unrecognized in this browser. ' +
+              'If you meant to render a React component, start its name with ' +
+              'an uppercase letter.',
+            type,
+          );
+        }
       }
     }
 
@@ -466,13 +541,13 @@ var ReactDOMFiberComponent = {
       case 'input':
         // TODO: Make sure we check if this is still unmounted or do any clean
         // up necessary since we never stop tracking anymore.
-        inputValueTracking.trackNode((domElement: any));
+        inputValueTracking.track((domElement: any));
         ReactDOMFiberInput.postMountWrapper(domElement, rawProps);
         break;
       case 'textarea':
         // TODO: Make sure we check if this is still unmounted or do any clean
         // up necessary since we never stop tracking anymore.
-        inputValueTracking.trackNode((domElement: any));
+        inputValueTracking.track((domElement: any));
         ReactDOMFiberTextarea.postMountWrapper(domElement, rawProps);
         break;
       case 'option':
@@ -711,6 +786,10 @@ var ReactDOMFiberComponent = {
         // happen after `updateDOMProperties`. Otherwise HTML5 input validations
         // raise warnings and prevent the new value from being assigned.
         ReactDOMFiberInput.updateWrapper(domElement, nextRawProps);
+
+        // We also check that we haven't missed a value update, such as a
+        // Radio group shifting the checked value to another named radio input.
+        inputValueTracking.updateValueIfChanged((domElement: any));
         break;
       case 'textarea':
         ReactDOMFiberTextarea.updateWrapper(domElement, nextRawProps);
@@ -845,6 +924,36 @@ var ReactDOMFiberComponent = {
 
     assertValidProps(tag, rawProps, getCurrentFiberOwnerName);
 
+    if (__DEV__) {
+      var extraAttributeNames: Set<string> = new Set();
+      var attributes = domElement.attributes;
+      for (var i = 0; i < attributes.length; i++) {
+        // TODO: Do we need to lower case this to get case insensitive matches?
+        var name = attributes[i].name;
+        switch (name) {
+          // Built-in attributes are whitelisted
+          // TODO: Once these are gone from the server renderer, we don't need
+          // this whitelist aynymore.
+          case 'data-reactroot':
+            break;
+          case 'data-reactid':
+            break;
+          case 'data-react-checksum':
+            break;
+          // Controlled attributes are not validated
+          // TODO: Only ignore them on controlled tags.
+          case 'value':
+            break;
+          case 'checked':
+            break;
+          case 'selected':
+            break;
+          default:
+            extraAttributeNames.add(attributes[i].name);
+        }
+      }
+    }
+
     var updatePayload = null;
     for (var propKey in rawProps) {
       if (!rawProps.hasOwnProperty(propKey)) {
@@ -863,10 +972,16 @@ var ReactDOMFiberComponent = {
         // TODO: Should we use domElement.firstChild.nodeValue to compare?
         if (typeof nextProp === 'string') {
           if (domElement.textContent !== nextProp) {
+            if (__DEV__) {
+              warnForTextDifference(domElement.textContent, nextProp);
+            }
             updatePayload = [CHILDREN, nextProp];
           }
         } else if (typeof nextProp === 'number') {
           if (domElement.textContent !== '' + nextProp) {
+            if (__DEV__) {
+              warnForTextDifference(domElement.textContent, nextProp);
+            }
             updatePayload = [CHILDREN, '' + nextProp];
           }
         }
@@ -874,6 +989,70 @@ var ReactDOMFiberComponent = {
         if (nextProp) {
           ensureListeningTo(rootContainerElement, propKey);
         }
+      } else if (__DEV__) {
+        // Validate that the properties correspond to their expected values.
+        var serverValue;
+        var propertyInfo;
+        if (
+          propKey === SUPPRESS_CONTENT_EDITABLE_WARNING ||
+          // Controlled attributes are not validated
+          // TODO: Only ignore them on controlled tags.
+          propKey === 'value' ||
+          propKey === 'checked' ||
+          propKey === 'selected'
+        ) {
+          // Noop
+        } else if (propKey === DANGEROUSLY_SET_INNER_HTML) {
+          const rawHtml = nextProp ? nextProp[HTML] || '' : '';
+          const serverHTML = domElement.innerHTML;
+          const expectedHTML = normalizeHTML(domElement, rawHtml);
+          if (expectedHTML !== serverHTML) {
+            warnForPropDifference(propKey, serverHTML, expectedHTML);
+          }
+        } else if (propKey === STYLE) {
+          // $FlowFixMe - Should be inferred as not undefined.
+          extraAttributeNames.delete(propKey);
+          const expectedStyle = CSSPropertyOperations.createDangerousStringForStyles(
+            nextProp,
+          );
+          serverValue = domElement.getAttribute('style');
+          if (expectedStyle !== serverValue) {
+            warnForPropDifference(propKey, serverValue, expectedStyle);
+          }
+        } else if (
+          isCustomComponentTag ||
+          DOMProperty.isCustomAttribute(propKey)
+        ) {
+          // $FlowFixMe - Should be inferred as not undefined.
+          extraAttributeNames.delete(propKey);
+          serverValue = DOMPropertyOperations.getValueForAttribute(
+            domElement,
+            propKey,
+            nextProp,
+          );
+          if (nextProp !== serverValue) {
+            warnForPropDifference(propKey, serverValue, nextProp);
+          }
+        } else if ((propertyInfo = DOMProperty.properties[propKey])) {
+          // $FlowFixMe - Should be inferred as not undefined.
+          extraAttributeNames.delete(propertyInfo.attributeName);
+          serverValue = DOMPropertyOperations.getValueForProperty(
+            domElement,
+            propKey,
+            nextProp,
+          );
+          if (nextProp !== serverValue) {
+            warnForPropDifference(propKey, serverValue, nextProp);
+          }
+        }
+      }
+    }
+
+    if (__DEV__) {
+      // $FlowFixMe - Should be inferred as not undefined.
+      if (extraAttributeNames.size > 0) {
+        // $FlowFixMe - Should be inferred as not undefined.
+        warnForExtraAttributes(extraAttributeNames);
       }
     }
 
@@ -881,13 +1060,13 @@ var ReactDOMFiberComponent = {
       case 'input':
         // TODO: Make sure we check if this is still unmounted or do any clean
         // up necessary since we never stop tracking anymore.
-        inputValueTracking.trackNode((domElement: any));
+        inputValueTracking.track((domElement: any));
         ReactDOMFiberInput.postMountWrapper(domElement, rawProps);
         break;
       case 'textarea':
         // TODO: Make sure we check if this is still unmounted or do any clean
         // up necessary since we never stop tracking anymore.
-        inputValueTracking.trackNode((domElement: any));
+        inputValueTracking.track((domElement: any));
         ReactDOMFiberTextarea.postMountWrapper(domElement, rawProps);
         break;
       case 'select':
@@ -907,6 +1086,90 @@ var ReactDOMFiberComponent = {
     }
 
     return updatePayload;
+  },
+
+  diffHydratedText(textNode: Text, text: string): boolean {
+    const isDifferent = textNode.nodeValue !== text;
+    if (__DEV__) {
+      if (isDifferent) {
+        warnForTextDifference(textNode.nodeValue, text);
+      }
+    }
+    return isDifferent;
+  },
+
+  warnForDeletedHydratableElement(
+    parentNode: Element | Document,
+    child: Element,
+  ) {
+    if (__DEV__) {
+      if (didWarnInvalidHydration) {
+        return;
+      }
+      didWarnInvalidHydration = true;
+      warning(
+        false,
+        'Did not expect server HTML to contain a <%s> in <%s>.',
+        child.nodeName.toLowerCase(),
+        parentNode.nodeName.toLowerCase(),
+      );
+    }
+  },
+
+  warnForDeletedHydratableText(parentNode: Element | Document, child: Text) {
+    if (__DEV__) {
+      if (didWarnInvalidHydration) {
+        return;
+      }
+      didWarnInvalidHydration = true;
+      warning(
+        false,
+        'Did not expect server HTML to contain the text node "%s" in <%s>.',
+        child.nodeValue,
+        parentNode.nodeName.toLowerCase(),
+      );
+    }
+  },
+
+  warnForInsertedHydratedElement(
+    parentNode: Element | Document,
+    tag: string,
+    props: Object,
+  ) {
+    if (__DEV__) {
+      if (didWarnInvalidHydration) {
+        return;
+      }
+      didWarnInvalidHydration = true;
+      warning(
+        false,
+        'Expected server HTML to contain a matching <%s> in <%s>.',
+        tag,
+        parentNode.nodeName.toLowerCase(),
+      );
+    }
+  },
+
+  warnForInsertedHydratedText(parentNode: Element | Document, text: string) {
+    if (__DEV__) {
+      if (text === '') {
+        // We expect to insert empty text nodes since they're not represented in
+        // the HTML.
+        // TODO: Remove this special case if we can just avoid inserting empty
+        // text nodes.
+        return;
+      }
+      if (didWarnInvalidHydration) {
+        return;
+      }
+      didWarnInvalidHydration = true;
+      warning(
+        false,
+        'Expected server HTML to contain a matching text node for "%s" in <%s>.',
+        text,
+        parentNode.nodeName.toLowerCase(),
+      );
+    }
   },
 
   restoreControlledState(

@@ -28,8 +28,9 @@ describe('ReactCompositeComponent', () => {
     React = require('react');
     ReactDOM = require('react-dom');
     ReactDOMServer = require('react-dom/server');
-    ReactCurrentOwner = require('ReactCurrentOwner');
-    ReactTestUtils = require('ReactTestUtils');
+    ReactCurrentOwner = require('react')
+      .__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED.ReactCurrentOwner;
+    ReactTestUtils = require('react-dom/test-utils');
     PropTypes = require('prop-types');
     shallowEqual = require('fbjs/lib/shallowEqual');
 
@@ -1470,5 +1471,20 @@ describe('ReactCompositeComponent', () => {
     // Re-render because the object changed
     instance.setState(getInitialState());
     expect(renderCalls).toBe(3);
+  });
+
+  it('should call setState callback with no arguments', () => {
+    let mockArgs;
+    class Component extends React.Component {
+      componentDidMount() {
+        this.setState({}, (...args) => (mockArgs = args));
+      }
+      render() {
+        return false;
+      }
+    }
+
+    ReactTestUtils.renderIntoDocument(<Component />);
+    expect(mockArgs.length).toEqual(0);
   });
 });

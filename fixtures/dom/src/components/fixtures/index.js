@@ -7,6 +7,8 @@ import InputChangeEvents from './input-change-events';
 import NumberInputFixtures from './number-inputs';
 import PasswordInputFixtures from './password-inputs';
 import ButtonFixtures from './buttons';
+import DateInputFixtures from './date-inputs';
+import ErrorHandling from './error-handling';
 
 /**
  * A simple routing component that renders the appropriate
@@ -29,7 +31,11 @@ function FixturesPage() {
     case '/password-inputs':
       return <PasswordInputFixtures />;
     case '/buttons':
-      return <ButtonFixtures />
+      return <ButtonFixtures />;
+    case '/date-inputs':
+      return <DateInputFixtures />;
+    case '/error-handling':
+      return <ErrorHandling />;
     default:
       return <p>Please select a test fixture.</p>;
   }

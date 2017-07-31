@@ -76,36 +76,44 @@ function getHeaderSanityCheck(bundleType, hasteName) {
 
 function getBanner(bundleType, hasteName, filename) {
   switch (bundleType) {
+    // UMDs are not wrapped in conditions.
+    case UMD_DEV:
+    case UMD_PROD:
+      return Header.getUMDHeader(filename, reactVersion);
+    // CommonJS DEV bundle is guarded to help weak dead code elimination.
+    case NODE_DEV:
+      return `'use strict';\n\n\nif (process.env.NODE_ENV !== "production") {\n`;
+    case NODE_PROD:
+      return '';
+    // All FB and RN bundles need Haste headers.
+    // FB DEV bundles are also guarded;
+    // RN bundles are not b'c of an older JSC packaged for Android.
+    // See github.com/facebook/react-native/issues/14995
     case FB_DEV:
     case FB_PROD:
     case RN_DEV:
     case RN_PROD:
-      let hasteFinalName = hasteName;
-      switch (bundleType) {
-        case FB_DEV:
-        case RN_DEV:
-          hasteFinalName += '-dev';
-          break;
-        case FB_PROD:
-        case RN_PROD:
-          hasteFinalName += '-prod';
-          break;
-      }
-      const fbDevCode = `\n\n'use strict';\n\n` + `\nif (__DEV__) {\n`;
-      return Header.getProvidesHeader(hasteFinalName, bundleType, fbDevCode);
-    case UMD_DEV:
-    case UMD_PROD:
-      return Header.getUMDHeader(filename, reactVersion);
+      const isDev = bundleType === FB_DEV || bundleType === RN_DEV;
+      const hasteFinalName = hasteName + (isDev ? '-dev' : '-prod');
+      return (
+        Header.getProvidesHeader(hasteFinalName) +
+        (bundleType === FB_DEV ? `\n\n'use strict';\n\n\nif (__DEV__) {\n` : '')
+      );
     default:
-      return '';
+      throw new Error('Unknown type.');
   }
 }
 
 function getFooter(bundleType) {
-  if (bundleType === FB_DEV) {
-    return '\n}\n';
+  // Only need a footer if getBanner() has an opening brace.
+  switch (bundleType) {
+    // Non-UMD DEV bundles need conditions to help weak dead code elimination.
+    case NODE_DEV:
+    case FB_DEV:
+      return '\n}\n';
+    default:
+      return '';
   }
-  return '';
 }
 
 function updateBabelConfig(babelOpts, bundleType) {
@@ -143,12 +151,6 @@ function updateBundleConfig(config, filename, format, bundleType, hasteName) {
     format,
     interop: false,
   });
-}
-
-function setReactNativeUseFiberEnvVariable(useFiber) {
-  return {
-    'process.env.REACT_NATIVE_USE_FIBER': useFiber,
-  };
 }
 
 function stripEnvVariables(production) {
@@ -338,7 +340,6 @@ function getPlugins(
     case RN_PROD:
       plugins.push(
         replace(stripEnvVariables(bundleType === RN_PROD)),
-        replace(setReactNativeUseFiberEnvVariable(useFiber)),
         // needs to happen after strip env
         commonjs(getCommonJsConfig(bundleType)),
         uglify(

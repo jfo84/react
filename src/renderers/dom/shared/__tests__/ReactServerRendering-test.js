@@ -20,6 +20,7 @@ var ReactMarkupChecksum;
 var ReactReconcileTransaction;
 var ReactTestUtils;
 var PropTypes;
+var ReactFeatureFlags;
 
 var ID_ATTRIBUTE_NAME;
 var ROOT_ATTRIBUTE_NAME;
@@ -29,11 +30,14 @@ describe('ReactDOMServer', () => {
     jest.resetModules();
     React = require('react');
     ReactDOM = require('react-dom');
+    ReactTestUtils = require('react-dom/test-utils');
     ReactDOMFeatureFlags = require('ReactDOMFeatureFlags');
     ReactMarkupChecksum = require('ReactMarkupChecksum');
-    ReactTestUtils = require('ReactTestUtils');
     ReactReconcileTransaction = require('ReactReconcileTransaction');
     PropTypes = require('prop-types');
+
+    ReactFeatureFlags = require('ReactFeatureFlags');
+    ReactFeatureFlags.disableNewFiberFeatures = false;
 
     ExecutionEnvironment = require('fbjs/lib/ExecutionEnvironment');
     ExecutionEnvironment.canUseDOM = false;
@@ -53,9 +57,11 @@ describe('ReactDOMServer', () => {
             ROOT_ATTRIBUTE_NAME +
             '="" ' +
             ID_ATTRIBUTE_NAME +
-            '="[^"]+" ' +
-            ReactMarkupChecksum.CHECKSUM_ATTR_NAME +
-            '="[^"]+">hello world</span>',
+            '="[^"]*"' +
+            (ReactDOMFeatureFlags.useFiber
+              ? ''
+              : ' ' + ReactMarkupChecksum.CHECKSUM_ATTR_NAME + '="[^"]+"') +
+            '>hello world</span>',
         ),
       );
     });
@@ -68,9 +74,11 @@ describe('ReactDOMServer', () => {
             ROOT_ATTRIBUTE_NAME +
             '="" ' +
             ID_ATTRIBUTE_NAME +
-            '="[^"]+" ' +
-            ReactMarkupChecksum.CHECKSUM_ATTR_NAME +
-            '="[^"]+"/>',
+            '="[^"]*"' +
+            (ReactDOMFeatureFlags.useFiber
+              ? ''
+              : ' ' + ReactMarkupChecksum.CHECKSUM_ATTR_NAME + '="[^"]+"') +
+            '/>',
         ),
       );
     });
@@ -83,9 +91,11 @@ describe('ReactDOMServer', () => {
             ROOT_ATTRIBUTE_NAME +
             '="" ' +
             ID_ATTRIBUTE_NAME +
-            '="[^"]+" ' +
-            ReactMarkupChecksum.CHECKSUM_ATTR_NAME +
-            '="[^"]+"/>',
+            '="[^"]*"' +
+            (ReactDOMFeatureFlags.useFiber
+              ? ''
+              : ' ' + ReactMarkupChecksum.CHECKSUM_ATTR_NAME + '="[^"]+"') +
+            '/>',
         ),
       );
     });
@@ -98,7 +108,11 @@ describe('ReactDOMServer', () => {
       }
 
       var response = ReactDOMServer.renderToString(<NullComponent />);
-      expect(response).toBe('<!-- react-empty: 1 -->');
+      if (ReactDOMFeatureFlags.useFiber) {
+        expect(response).toBe('');
+      } else {
+        expect(response).toBe('<!-- react-empty: 1 -->');
+      }
     });
 
     // TODO: Test that listeners are not registered onto any document/container.
@@ -123,14 +137,18 @@ describe('ReactDOMServer', () => {
             ROOT_ATTRIBUTE_NAME +
             '="" ' +
             ID_ATTRIBUTE_NAME +
-            '="[^"]+" ' +
-            ReactMarkupChecksum.CHECKSUM_ATTR_NAME +
-            '="[^"]+">' +
+            '="[^"]*"' +
+            (ReactDOMFeatureFlags.useFiber
+              ? ''
+              : ' ' + ReactMarkupChecksum.CHECKSUM_ATTR_NAME + '="[^"]+"') +
+            '>' +
             '<span ' +
             ID_ATTRIBUTE_NAME +
-            '="[^"]+">' +
-            '<!-- react-text: [0-9]+ -->My name is <!-- /react-text -->' +
-            '<!-- react-text: [0-9]+ -->child<!-- /react-text -->' +
+            '="[^"]*">' +
+            (ReactDOMFeatureFlags.useFiber
+              ? 'My name is <!-- -->child'
+              : '<!-- react-text: [0-9]+ -->My name is <!-- /react-text -->' +
+                  '<!-- react-text: [0-9]+ -->child<!-- /react-text -->') +
             '</span>' +
             '</div>',
         ),
@@ -190,11 +208,15 @@ describe('ReactDOMServer', () => {
               ROOT_ATTRIBUTE_NAME +
               '="" ' +
               ID_ATTRIBUTE_NAME +
-              '="[^"]+" ' +
-              ReactMarkupChecksum.CHECKSUM_ATTR_NAME +
-              '="[^"]+">' +
-              '<!-- react-text: [0-9]+ -->Component name: <!-- /react-text -->' +
-              '<!-- react-text: [0-9]+ -->TestComponent<!-- /react-text -->' +
+              '="[^"]*"' +
+              (ReactDOMFeatureFlags.useFiber
+                ? ''
+                : ' ' + ReactMarkupChecksum.CHECKSUM_ATTR_NAME + '="[^"]+"') +
+              '>' +
+              (ReactDOMFeatureFlags.useFiber
+                ? 'Component name: <!-- -->TestComponent'
+                : '<!-- react-text: [0-9]+ -->Component name: <!-- /react-text -->' +
+                    '<!-- react-text: [0-9]+ -->TestComponent<!-- /react-text -->') +
               '</span>',
           ),
         );
@@ -301,8 +323,12 @@ describe('ReactDOMServer', () => {
 
     it('should throw with silly args', () => {
       expect(
-        ReactDOMServer.renderToString.bind(ReactDOMServer, 'not a component'),
-      ).toThrowError('renderToString(): You must pass a valid ReactElement.');
+        ReactDOMServer.renderToString.bind(ReactDOMServer, {x: 123}),
+      ).toThrowError(
+        ReactDOMFeatureFlags.useFiber
+          ? 'Objects are not valid as a React child (found: object with keys {x})'
+          : 'renderToString(): Invalid component element.',
+      );
     });
   });
 
@@ -413,12 +439,11 @@ describe('ReactDOMServer', () => {
 
     it('should throw with silly args', () => {
       expect(
-        ReactDOMServer.renderToStaticMarkup.bind(
-          ReactDOMServer,
-          'not a component',
-        ),
+        ReactDOMServer.renderToStaticMarkup.bind(ReactDOMServer, {x: 123}),
       ).toThrowError(
-        'renderToStaticMarkup(): You must pass a valid ReactElement.',
+        ReactDOMFeatureFlags.useFiber
+          ? 'Objects are not valid as a React child (found: object with keys {x})'
+          : 'renderToStaticMarkup(): Invalid component element.',
       );
     });
 

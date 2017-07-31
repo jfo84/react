@@ -11,6 +11,11 @@
 
 'use strict';
 
+const ReactDOMFeatureFlags = require('ReactDOMFeatureFlags');
+const {COMMENT_NODE} = require('HTMLNodeType');
+
+const invariant = require('invariant');
+
 var React;
 var ReactDOM;
 var ReactDOMServer;
@@ -24,7 +29,7 @@ describe('ReactMount', () => {
     React = require('react');
     ReactDOM = require('react-dom');
     ReactDOMServer = require('react-dom/server');
-    ReactTestUtils = require('ReactTestUtils');
+    ReactTestUtils = require('react-dom/test-utils');
 
     try {
       if (WebComponents === undefined && typeof jest !== 'undefined') {
@@ -149,6 +154,8 @@ describe('ReactMount', () => {
     ReactDOM.render(<div />, container);
     expectDev(console.error.calls.count()).toBe(1);
 
+    ReactDOM.unmountComponentAtNode(container);
+
     container.innerHTML = ' ' + ReactDOMServer.renderToString(<div />);
 
     ReactDOM.render(<div />, container);
@@ -190,10 +197,17 @@ describe('ReactMount', () => {
       div,
     );
     expectDev(console.error.calls.count()).toBe(1);
-    expectDev(console.error.calls.argsFor(0)[0]).toContain(
-      ' (client) nbsp entity: &nbsp; client text</div>\n' +
-        ' (server) nbsp entity: &nbsp; server text</div>',
-    );
+    if (ReactDOMFeatureFlags.useFiber) {
+      expectDev(console.error.calls.argsFor(0)[0]).toContain(
+        'Server: "This markup contains an nbsp entity:   server text" ' +
+          'Client: "This markup contains an nbsp entity:   client text"',
+      );
+    } else {
+      expectDev(console.error.calls.argsFor(0)[0]).toContain(
+        ' (client) nbsp entity: &nbsp; client text</div>\n' +
+          ' (server) nbsp entity: &nbsp; server text</div>',
+      );
+    }
   });
 
   if (WebComponents !== undefined) {
@@ -310,4 +324,80 @@ describe('ReactMount', () => {
 
     expect(calls).toBe(5);
   });
+
+  it('initial mount is sync inside batchedUpdates, but task work is deferred until the end of the batch', () => {
+    var container1 = document.createElement('div');
+    var container2 = document.createElement('div');
+
+    class Foo extends React.Component {
+      state = {active: false};
+      componentDidMount() {
+        this.setState({active: true});
+      }
+      render() {
+        return (
+          <div>{this.props.children + (this.state.active ? '!' : '')}</div>
+        );
+      }
+    }
+
+    ReactDOM.render(<div>1</div>, container1);
+
+    ReactDOM.unstable_batchedUpdates(() => {
+      // Update. Does not flush yet.
+      ReactDOM.render(<div>2</div>, container1);
+      expect(container1.textContent).toEqual('1');
+
+      // Initial mount on another root. Should flush immediately.
+      ReactDOM.render(<Foo>a</Foo>, container2);
+      // The update did not flush yet.
+      expect(container1.textContent).toEqual('1');
+      // The initial mount flushed, but not the update scheduled in cDU.
+      expect(container2.textContent).toEqual('a');
+    });
+    // All updates have flushed.
+    expect(container1.textContent).toEqual('2');
+    expect(container2.textContent).toEqual('a!');
+  });
+
+  if (ReactDOMFeatureFlags.useFiber) {
+    describe('mount point is a comment node', () => {
+      let containerDiv;
+      let mountPoint;
+
+      beforeEach(() => {
+        const ReactFeatureFlags = require('ReactFeatureFlags');
+        ReactFeatureFlags.disableNewFiberFeatures = false;
+
+        containerDiv = document.createElement('div');
+        containerDiv.innerHTML = 'A<!-- react-mount-point-unstable -->B';
+        mountPoint = containerDiv.childNodes[1];
+        invariant(mountPoint.nodeType === COMMENT_NODE, 'Expected comment');
+      });
+
+      it('renders at a comment node', () => {
+        function Char(props) {
+          return props.children;
+        }
+        function list(chars) {
+          return chars.split('').map(c => <Char key={c}>{c}</Char>);
+        }
+
+        ReactDOM.render(list('aeiou'), mountPoint);
+        expect(containerDiv.innerHTML).toBe(
+          'Aaeiou<!-- react-mount-point-unstable -->B',
+        );
+
+        ReactDOM.render(list('yea'), mountPoint);
+        expect(containerDiv.innerHTML).toBe(
+          'Ayea<!-- react-mount-point-unstable -->B',
+        );
+
+        ReactDOM.render(list(''), mountPoint);
+        expect(containerDiv.innerHTML).toBe(
+          'A<!-- react-mount-point-unstable -->B',
+        );
+      });
+    });
+  }
 });

@@ -11,22 +11,32 @@
 
 'use strict';
 
+let ReactDOMFeatureFlags = require('ReactDOMFeatureFlags');
+
 let ExecutionEnvironment;
 let PropTypes;
 let React;
 let ReactDOM;
 let ReactDOMServer;
-let ReactDOMFeatureFlags;
+let ReactDOMNodeStream;
 let ReactTestUtils;
+
+const stream = require('stream');
+
+const TEXT_NODE_TYPE = 3;
+const COMMENT_NODE_TYPE = 8;
 
 // Helper functions for rendering tests
 // ====================================
 
 // promisified version of ReactDOM.render()
 function asyncReactDOMRender(reactElement, domElement) {
-  return new Promise(resolve =>
-    ReactDOM.render(reactElement, domElement, resolve),
-  );
+  return new Promise(resolve => {
+    ReactDOM.render(reactElement, domElement);
+    // We can't use the callback for resolution because that will not catch
+    // errors. They're thrown.
+    resolve();
+  });
 }
 // performs fn asynchronously and expects count errors logged to console.error.
 // will fail the test if the count of errors logged is not equal to count.
@@ -87,6 +97,42 @@ async function serverRender(reactElement, errorCount = 0) {
   return domElement.firstChild;
 }
 
+// this just drains a readable piped into it to a string, which can be accessed
+// via .buffer.
+class DrainWritable extends stream.Writable {
+  constructor(options) {
+    super(options);
+    this.buffer = '';
+  }
+
+  _write(chunk, encoding, cb) {
+    this.buffer += chunk;
+    cb();
+  }
+}
+
+async function renderIntoStream(reactElement, errorCount = 0) {
+  return await expectErrors(
+    () =>
+      new Promise(resolve => {
+        let writable = new DrainWritable();
+        ReactDOMNodeStream.renderToStream(reactElement).pipe(writable);
+        writable.on('finish', () => resolve(writable.buffer));
+      }),
+    errorCount,
+  );
+}
+
+// Renders text using node stream SSR and then stuffs it into a DOM node;
+// returns the DOM element that corresponds with the reactElement.
+// Does not render on client or perform client-side revival.
+async function streamRender(reactElement, errorCount = 0) {
+  const markup = await renderIntoStream(reactElement, errorCount);
+  var domElement = document.createElement('div');
+  domElement.innerHTML = markup;
+  return domElement.firstChild;
+}
+
 const clientCleanRender = (element, errorCount = 0) => {
   const div = document.createElement('div');
   return renderIntoDom(element, div, errorCount);
@@ -95,15 +141,36 @@ const clientCleanRender = (element, errorCount = 0) => {
 const clientRenderOnServerString = async (element, errorCount = 0) => {
   const markup = await renderIntoString(element, errorCount);
   resetModules();
+
   var domElement = document.createElement('div');
   domElement.innerHTML = markup;
-  const serverElement = domElement.firstChild;
-  const clientElement = await renderIntoDom(element, domElement, errorCount);
-  // assert that the DOM element hasn't been replaced.
-  // Note that we cannot use expect(serverElement).toBe(clientElement) because
-  // of jest bug #1772
-  expect(serverElement === clientElement).toBe(true);
-  return clientElement;
+  let serverNode = domElement.firstChild;
+
+  const firstClientNode = await renderIntoDom(element, domElement, errorCount);
+  let clientNode = firstClientNode;
+
+  // Make sure all top level nodes match up
+  while (serverNode || clientNode) {
+    expect(serverNode != null).toBe(true);
+    expect(clientNode != null).toBe(true);
+    expect(clientNode.nodeType).toBe(serverNode.nodeType);
+    if (clientNode.nodeType === TEXT_NODE_TYPE) {
+      // Text nodes are stateless so we can just compare values.
+      // This works around a current issue where hydration replaces top-level
+      // text node, but otherwise works.
+      // TODO: we can remove this branch if we add explicit hydration opt-in.
+      // https://github.com/facebook/react/issues/10189
+      expect(serverNode.nodeValue).toBe(clientNode.nodeValue);
+    } else {
+      // Assert that the DOM element hasn't been replaced.
+      // Note that we cannot use expect(serverNode).toBe(clientNode) because
+      // of jest bug #1772.
+      expect(serverNode === clientNode).toBe(true);
+    }
+    serverNode = serverNode.nextSibling;
+    clientNode = clientNode.nextSibling;
+  }
+  return firstClientNode;
 };
 
 function BadMarkupExpected() {}
@@ -149,6 +216,9 @@ const clientRenderOnBadMarkup = async (element, errorCount = 0) => {
 // as that will not work in the server string scenario.
 function itRenders(desc, testFn) {
   it(`renders ${desc} with server string render`, () => testFn(serverRender));
+  if (ReactDOMFeatureFlags.useFiber) {
+    it(`renders ${desc} with server stream render`, () => testFn(streamRender));
+  }
   itClientRenders(desc, testFn);
 }
 
@@ -181,22 +251,28 @@ function itClientRenders(desc, testFn) {
   });
 }
 
-function itThrows(desc, testFn) {
+function itThrows(desc, testFn, partialMessage) {
   it(`throws ${desc}`, () => {
-    return testFn()
-      .then(() =>
-        expect(false).toBe('The promise resolved and should not have.'),
-      )
-      .catch(() => {});
+    return testFn().then(
+      () => expect(false).toBe('The promise resolved and should not have.'),
+      err => {
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toContain(partialMessage);
+      },
+    );
   });
 }
 
-function itThrowsWhenRendering(desc, testFn) {
-  itThrows(`when rendering ${desc} with server string render`, () =>
-    testFn(serverRender),
+function itThrowsWhenRendering(desc, testFn, partialMessage) {
+  itThrows(
+    `when rendering ${desc} with server string render`,
+    () => testFn(serverRender),
+    partialMessage,
   );
-  itThrows(`when rendering ${desc} with clean client render`, () =>
-    testFn(clientCleanRender),
+  itThrows(
+    `when rendering ${desc} with clean client render`,
+    () => testFn(clientCleanRender),
+    partialMessage,
   );
 
   // we subtract one from the warning count here because the throw means that it won't
@@ -207,6 +283,7 @@ function itThrowsWhenRendering(desc, testFn) {
       testFn((element, warningCount = 0) =>
         clientRenderOnBadMarkup(element, warningCount - 1),
       ),
+    partialMessage,
   );
 }
 
@@ -235,19 +312,48 @@ function expectMarkupMismatch(serverElement, clientElement) {
   return testMarkupMatch(serverElement, clientElement, false);
 }
 
+// TODO: this is a hack for testing dynamic injection. Remove this when we decide
+// how to do static injection instead.
+let onAfterResetModules = null;
+
 // When there is a test that renders on server and then on client and expects a logged
 // error, you want to see the error show up both on server and client. Unfortunately,
 // React refuses to issue the same error twice to avoid clogging up the console.
 // To get around this, we must reload React modules in between server and client render.
 function resetModules() {
+  // First, reset the modules to load the client renderer.
   jest.resetModuleRegistry();
-  PropTypes = require('prop-types');
-  React = require('React');
-  ReactDOM = require('ReactDOM');
-  ReactDOMServer = require('ReactDOMServer');
-  ReactDOMFeatureFlags = require('ReactDOMFeatureFlags');
-  ReactTestUtils = require('ReactTestUtils');
+  if (typeof onAfterResetModules === 'function') {
+    onAfterResetModules();
+  }
+
+  // TODO: can we express this test with only public API?
   ExecutionEnvironment = require('ExecutionEnvironment');
+
+  require('ReactFeatureFlags').disableNewFiberFeatures = false;
+  PropTypes = require('prop-types');
+  React = require('react');
+  ReactDOM = require('react-dom');
+  ReactDOMFeatureFlags = require('ReactDOMFeatureFlags');
+  ReactTestUtils = require('react-dom/test-utils');
+
+  // Now we reset the modules again to load the server renderer.
+  // Resetting is important because we want to avoid any shared state
+  // influencing the tests.
+  jest.resetModuleRegistry();
+  if (typeof onAfterResetModules === 'function') {
+    onAfterResetModules();
+  }
+  require('ReactFeatureFlags').disableNewFiberFeatures = false;
+  ReactDOMServer = require('react-dom/server');
+
+  // Finally, reset modules one more time before importing the stream renderer.
+  jest.resetModuleRegistry();
+  if (typeof onAfterResetModules === 'function') {
+    onAfterResetModules();
+  }
+  require('ReactFeatureFlags').disableNewFiberFeatures = false;
+  ReactDOMNodeStream = require('react-dom/node-stream');
 }
 
 describe('ReactDOMServerIntegration', () => {
@@ -263,12 +369,6 @@ describe('ReactDOMServerIntegration', () => {
       expect(e.tagName).toBe('DIV');
     });
 
-    itRenders('a div with inline styles', async render => {
-      const e = await render(<div style={{color: 'red', width: '30px'}} />);
-      expect(e.style.color).toBe('red');
-      expect(e.style.width).toBe('30px');
-    });
-
     itRenders('a self-closing tag', async render => {
       const e = await render(<br />);
       expect(e.tagName).toBe('BR');
@@ -279,6 +379,82 @@ describe('ReactDOMServerIntegration', () => {
       expect(e.childNodes.length).toBe(1);
       expect(e.firstChild.tagName).toBe('BR');
     });
+
+    if (ReactDOMFeatureFlags.useFiber) {
+      itRenders('a string', async render => {
+        let e = await render('Hello');
+        expect(e.nodeType).toBe(3);
+        expect(e.nodeValue).toMatch('Hello');
+      });
+
+      itRenders('a number', async render => {
+        let e = await render(42);
+        expect(e.nodeType).toBe(3);
+        expect(e.nodeValue).toMatch('42');
+      });
+
+      itRenders('an array with one child', async render => {
+        let e = await render([<div key={1}>text1</div>]);
+        let parent = e.parentNode;
+        expect(parent.childNodes[0].tagName).toBe('DIV');
+      });
+
+      itRenders('an array with several children', async render => {
+        let Header = props => {
+          return <p>header</p>;
+        };
+        let Footer = props => {
+          return [<h2 key={1}>footer</h2>, <h3 key={2}>about</h3>];
+        };
+        let e = await render([
+          <div key={1}>text1</div>,
+          <span key={2}>text2</span>,
+          <Header key={3} />,
+          <Footer key={4} />,
+        ]);
+        let parent = e.parentNode;
+        expect(parent.childNodes[0].tagName).toBe('DIV');
+        expect(parent.childNodes[1].tagName).toBe('SPAN');
+        expect(parent.childNodes[2].tagName).toBe('P');
+        expect(parent.childNodes[3].tagName).toBe('H2');
+        expect(parent.childNodes[4].tagName).toBe('H3');
+      });
+
+      itRenders('a nested array', async render => {
+        let e = await render([
+          [<div key={1}>text1</div>],
+          <span key={1}>text2</span>,
+          [[[null, <p key={1} />], false]],
+        ]);
+        let parent = e.parentNode;
+        expect(parent.childNodes[0].tagName).toBe('DIV');
+        expect(parent.childNodes[1].tagName).toBe('SPAN');
+        expect(parent.childNodes[2].tagName).toBe('P');
+      });
+
+      itRenders('an iterable', async render => {
+        const threeDivIterable = {
+          '@@iterator': function() {
+            var i = 0;
+            return {
+              next: function() {
+                if (i++ < 3) {
+                  return {value: <div key={i} />, done: false};
+                } else {
+                  return {value: undefined, done: true};
+                }
+              },
+            };
+          },
+        };
+        let e = await render(threeDivIterable);
+        let parent = e.parentNode;
+        expect(parent.childNodes.length).toBe(3);
+        expect(parent.childNodes[0].tagName).toBe('DIV');
+        expect(parent.childNodes[1].tagName).toBe('DIV');
+        expect(parent.childNodes[2].tagName).toBe('DIV');
+      });
+    }
   });
 
   describe('property to attribute mapping', function() {
@@ -303,6 +479,11 @@ describe('ReactDOMServerIntegration', () => {
       itRenders('string prop with false value', async render => {
         const e = await render(<a href={false} />);
         expect(e.getAttribute('href')).toBe('false');
+      });
+
+      itRenders('no string prop with null value', async render => {
+        const e = await render(<div width={null} />);
+        expect(e.hasAttribute('width')).toBe(false);
       });
     });
 
@@ -359,6 +540,11 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div hidden={0} />);
         expect(e.getAttribute('hidden')).toBe(null);
       });
+
+      itRenders('no boolean prop with null value', async render => {
+        const e = await render(<div hidden={null} />);
+        expect(e.hasAttribute('hidden')).toBe(false);
+      });
     });
 
     describe('download property (combined boolean/string attribute)', function() {
@@ -377,9 +563,29 @@ describe('ReactDOMServerIntegration', () => {
         expect(e.getAttribute('download')).toBe('myfile');
       });
 
+      itRenders('download prop with string "false" value', async render => {
+        const e = await render(<a download="false" />);
+        expect(e.getAttribute('download')).toBe('false');
+      });
+
       itRenders('download prop with string "true" value', async render => {
         const e = await render(<a download={'true'} />);
         expect(e.getAttribute('download')).toBe('true');
+      });
+
+      itRenders('download prop with number 0 value', async render => {
+        const e = await render(<a download={0} />);
+        expect(e.getAttribute('download')).toBe('0');
+      });
+
+      itRenders('no download prop with null value', async render => {
+        const e = await render(<div download={null} />);
+        expect(e.hasAttribute('download')).toBe(false);
+      });
+
+      itRenders('no download prop with undefined value', async render => {
+        const e = await render(<div download={undefined} />);
+        expect(e.hasAttribute('download')).toBe(false);
       });
     });
 
@@ -405,6 +611,11 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div className={false} />);
         expect(e.getAttribute('class')).toBe('false');
       });
+
+      itRenders('no className prop with null value', async render => {
+        const e = await render(<div className={null} />);
+        expect(e.hasAttribute('className')).toBe(false);
+      });
     });
 
     describe('htmlFor property', function() {
@@ -419,15 +630,43 @@ describe('ReactDOMServerIntegration', () => {
       });
 
       // this probably is just masking programmer error, but it is existing behavior.
-      itRenders('className prop with true value', async render => {
+      itRenders('htmlFor prop with true value', async render => {
         const e = await render(<div htmlFor={true} />);
         expect(e.getAttribute('for')).toBe('true');
       });
 
       // this probably is just masking programmer error, but it is existing behavior.
-      itRenders('className prop with false value', async render => {
+      itRenders('htmlFor prop with false value', async render => {
         const e = await render(<div htmlFor={false} />);
         expect(e.getAttribute('for')).toBe('false');
+      });
+
+      itRenders('no htmlFor prop with null value', async render => {
+        const e = await render(<div htmlFor={null} />);
+        expect(e.hasAttribute('htmlFor')).toBe(false);
+      });
+    });
+
+    describe('numeric properties', function() {
+      itRenders(
+        'positive numeric property with positive value',
+        async render => {
+          const e = await render(<input size={2} />);
+          expect(e.getAttribute('size')).toBe('2');
+        },
+      );
+
+      itRenders(
+        'no positive numeric property with zero value',
+        async render => {
+          const e = await render(<input size={0} />);
+          expect(e.hasAttribute('size')).toBe(false);
+        },
+      );
+
+      itRenders('numeric property with zero value', async render => {
+        const e = await render(<ol start={0} />);
+        expect(e.getAttribute('start')).toBe('0');
       });
     });
 
@@ -460,6 +699,77 @@ describe('ReactDOMServerIntegration', () => {
       });
     });
 
+    describe('inline styles', function() {
+      itRenders('simple styles', async render => {
+        const e = await render(<div style={{color: 'red', width: '30px'}} />);
+        expect(e.style.color).toBe('red');
+        expect(e.style.width).toBe('30px');
+      });
+
+      itRenders('relevant styles with px', async render => {
+        const e = await render(
+          <div
+            style={{
+              left: 0,
+              margin: 16,
+              opacity: 0.5,
+              padding: '4px',
+            }}
+          />,
+        );
+        expect(e.style.left).toBe('0px');
+        expect(e.style.margin).toBe('16px');
+        expect(e.style.opacity).toBe('0.5');
+        expect(e.style.padding).toBe('4px');
+      });
+
+      itRenders('custom properties', async render => {
+        const e = await render(<div style={{'--foo': 5}} />);
+        // This seems like an odd way computed properties are exposed in jsdom.
+        // In a real browser we'd read it with e.style.getPropertyValue('--foo')
+        expect(e.style.Foo).toBe('5');
+      });
+
+      itRenders('no undefined styles', async render => {
+        const e = await render(
+          <div style={{color: undefined, width: '30px'}} />,
+        );
+        expect(e.style.color).toBe('');
+        expect(e.style.width).toBe('30px');
+      });
+
+      itRenders('no null styles', async render => {
+        const e = await render(<div style={{color: null, width: '30px'}} />);
+        expect(e.style.color).toBe('');
+        expect(e.style.width).toBe('30px');
+      });
+
+      itRenders('no empty styles', async render => {
+        const e = await render(<div style={{color: null, width: null}} />);
+        expect(e.style.color).toBe('');
+        expect(e.style.width).toBe('');
+        expect(e.hasAttribute('style')).toBe(false);
+      });
+    });
+
+    describe('aria attributes', function() {
+      itRenders('simple strings', async render => {
+        const e = await render(<div aria-label="hello" />);
+        expect(e.getAttribute('aria-label')).toBe('hello');
+      });
+
+      // this probably is just masking programmer error, but it is existing behavior.
+      itRenders('aria string prop with false value', async render => {
+        const e = await render(<div aria-label={false} />);
+        expect(e.getAttribute('aria-label')).toBe('false');
+      });
+
+      itRenders('no aria prop with null value', async render => {
+        const e = await render(<div aria-label={null} />);
+        expect(e.hasAttribute('aria-label')).toBe(false);
+      });
+    });
+
     describe('unknown attributes', function() {
       itRenders('no unknown attributes', async render => {
         const e = await render(<div foo="bar" />, 1);
@@ -469,6 +779,11 @@ describe('ReactDOMServerIntegration', () => {
       itRenders('unknown data- attributes', async render => {
         const e = await render(<div data-foo="bar" />);
         expect(e.getAttribute('data-foo')).toBe('bar');
+      });
+
+      itRenders('no unknown data- attributes with null value', async render => {
+        const e = await render(<div data-foo={null} />);
+        expect(e.hasAttribute('data-foo')).toBe(false);
       });
 
       itRenders(
@@ -485,10 +800,26 @@ describe('ReactDOMServerIntegration', () => {
       });
 
       itRenders(
+        'no unknown attributes for custom elements with null value',
+        async render => {
+          const e = await render(<custom-element foo={null} />);
+          expect(e.hasAttribute('foo')).toBe(false);
+        },
+      );
+
+      itRenders(
         'unknown attributes for custom elements using is',
         async render => {
           const e = await render(<div is="custom-element" foo="bar" />);
           expect(e.getAttribute('foo')).toBe('bar');
+        },
+      );
+
+      itRenders(
+        'no unknown attributes for custom elements using is with null value',
+        async render => {
+          const e = await render(<div is="custom-element" foo={null} />);
+          expect(e.hasAttribute('foo')).toBe(false);
         },
       );
     });
@@ -502,10 +833,6 @@ describe('ReactDOMServerIntegration', () => {
   });
 
   describe('elements and children', function() {
-    // helper functions.
-    const TEXT_NODE_TYPE = 3;
-    const COMMENT_NODE_TYPE = 8;
-
     function expectNode(node, type, value) {
       expect(node).not.toBe(null);
       expect(node.nodeType).toBe(type);
@@ -557,9 +884,10 @@ describe('ReactDOMServerIntegration', () => {
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are just three separate text node children,
           // each of which is blank.
-          if (render === serverRender) {
-            // For plain server markup result we expect six comment nodes.
-            expect(e.childNodes.length).toBe(6);
+          if (render === serverRender || render === streamRender) {
+            // For plain server markup result we should have no text nodes if
+            // they're all empty.
+            expect(e.childNodes.length).toBe(0);
             expect(e.textContent).toBe('');
           } else {
             expect(e.childNodes.length).toBe(3);
@@ -579,12 +907,18 @@ describe('ReactDOMServerIntegration', () => {
       itRenders('a div with multiple whitespace children', async render => {
         const e = await render(<div>{' '}{' '}{' '}</div>);
         if (ReactDOMFeatureFlags.useFiber) {
-          // with Fiber, there are just three text nodes.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(9);
-            expectTextNode(e.childNodes[1], ' ');
+          // with Fiber, there are normally just three text nodes
+          if (
+            render === serverRender ||
+            render === clientRenderOnServerString ||
+            render === streamRender
+          ) {
+            // For plain server markup result we have comments between.
+            // If we're able to hydrate, they remain.
+            expect(e.childNodes.length).toBe(5);
+            expectTextNode(e.childNodes[0], ' ');
+            expectTextNode(e.childNodes[2], ' ');
             expectTextNode(e.childNodes[4], ' ');
-            expectTextNode(e.childNodes[7], ' ');
           } else {
             expect(e.childNodes.length).toBe(3);
             expectTextNode(e.childNodes[0], ' ');
@@ -604,7 +938,7 @@ describe('ReactDOMServerIntegration', () => {
       itRenders('a div with text sibling to a node', async render => {
         const e = await render(<div>Text<span>More Text</span></div>);
         let spanNode;
-        if (ReactDOMFeatureFlags.useFiber && render !== serverRender) {
+        if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are only two children, the "Text" text node and
           // the span element.
           expect(e.childNodes.length).toBe(2);
@@ -615,11 +949,7 @@ describe('ReactDOMServerIntegration', () => {
           expect(e.childNodes.length).toBe(4);
           spanNode = e.childNodes[3];
         }
-        if (ReactDOMFeatureFlags.useFiber && render === serverRender) {
-          expectTextNode(e.childNodes[1], 'Text');
-        } else {
-          expectTextNode(e.childNodes[0], 'Text');
-        }
+        expectTextNode(e.childNodes[0], 'Text');
         expect(spanNode.tagName).toBe('SPAN');
         expect(spanNode.childNodes.length).toBe(1);
         expectNode(spanNode.firstChild, TEXT_NODE_TYPE, 'More Text');
@@ -643,9 +973,9 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>{''}foo</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are just two text nodes.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(5);
-            expectTextNode(e.childNodes[3], 'foo');
+          if (render === serverRender || render === streamRender) {
+            expect(e.childNodes.length).toBe(1);
+            expectTextNode(e.childNodes[0], 'foo');
           } else {
             expect(e.childNodes.length).toBe(2);
             expectTextNode(e.childNodes[0], '');
@@ -665,9 +995,9 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>foo{''}</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are just two text nodes.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(5);
-            expectTextNode(e.childNodes[1], 'foo');
+          if (render === serverRender || render === streamRender) {
+            expect(e.childNodes.length).toBe(1);
+            expectTextNode(e.childNodes[0], 'foo');
           } else {
             expect(e.childNodes.length).toBe(2);
             expectTextNode(e.childNodes[0], 'foo');
@@ -687,10 +1017,15 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>{'foo'}{'bar'}</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are just two text nodes.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(6);
-            expectTextNode(e.childNodes[1], 'foo');
-            expectTextNode(e.childNodes[4], 'bar');
+          if (
+            render === serverRender ||
+            render === clientRenderOnServerString ||
+            render === streamRender
+          ) {
+            // In the server render output there's a comment between them.
+            expect(e.childNodes.length).toBe(3);
+            expectTextNode(e.childNodes[0], 'foo');
+            expectTextNode(e.childNodes[2], 'bar');
           } else {
             expect(e.childNodes.length).toBe(2);
             expectTextNode(e.childNodes[0], 'foo');
@@ -722,10 +1057,15 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>{'foo'}{40}</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are just two text nodes.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(6);
-            expectTextNode(e.childNodes[1], 'foo');
-            expectTextNode(e.childNodes[4], '40');
+          if (
+            render === serverRender ||
+            render === clientRenderOnServerString ||
+            render === streamRender
+          ) {
+            // In the server markup there's a comment between.
+            expect(e.childNodes.length).toBe(3);
+            expectTextNode(e.childNodes[0], 'foo');
+            expectTextNode(e.childNodes[2], '40');
           } else {
             expect(e.childNodes.length).toBe(2);
             expectTextNode(e.childNodes[0], 'foo');
@@ -762,12 +1102,7 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div><NullComponent /></div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, an empty component results in no markup.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(1);
-            expectEmptyNode(e.firstChild);
-          } else {
-            expect(e.childNodes.length).toBe(0);
-          }
+          expect(e.childNodes.length).toBe(0);
         } else {
           // with Stack, an empty component results in one react-empty comment
           // node.
@@ -780,13 +1115,8 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>{null}foo</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there is just one text node.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(3);
-            expectTextNode(e.childNodes[1], 'foo');
-          } else {
-            expect(e.childNodes.length).toBe(1);
-            expectTextNode(e.childNodes[0], 'foo');
-          }
+          expect(e.childNodes.length).toBe(1);
+          expectTextNode(e.childNodes[0], 'foo');
         } else {
           // with Stack, there's a text node surronded by react-text comment nodes.
           expect(e.childNodes.length).toBe(3);
@@ -798,13 +1128,8 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>{false}foo</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there is just one text node.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(3);
-            expectTextNode(e.childNodes[1], 'foo');
-          } else {
-            expect(e.childNodes.length).toBe(1);
-            expectTextNode(e.childNodes[0], 'foo');
-          }
+          expect(e.childNodes.length).toBe(1);
+          expectTextNode(e.childNodes[0], 'foo');
         } else {
           // with Stack, there's a text node surronded by react-text comment nodes.
           expect(e.childNodes.length).toBe(3);
@@ -816,13 +1141,8 @@ describe('ReactDOMServerIntegration', () => {
         const e = await render(<div>{false}{null}foo{null}{false}</div>);
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there is just one text node.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(3);
-            expectTextNode(e.childNodes[1], 'foo');
-          } else {
-            expect(e.childNodes.length).toBe(1);
-            expectTextNode(e.childNodes[0], 'foo');
-          }
+          expect(e.childNodes.length).toBe(1);
+          expectTextNode(e.childNodes[0], 'foo');
         } else {
           // with Stack, there's a text node surronded by react-text comment nodes.
           expect(e.childNodes.length).toBe(3);
@@ -1021,17 +1341,10 @@ describe('ReactDOMServerIntegration', () => {
           if (ReactDOMFeatureFlags.useFiber) {
             // with Fiber, there are three children: the child1 element, a
             // single space text node, and the child2 element.
-            if (render === serverRender) {
-              expect(e.childNodes.length).toBe(5);
-              child1 = e.childNodes[0];
-              textNode = e.childNodes[2];
-              child2 = e.childNodes[4];
-            } else {
-              expect(e.childNodes.length).toBe(3);
-              child1 = e.childNodes[0];
-              textNode = e.childNodes[1];
-              child2 = e.childNodes[2];
-            }
+            expect(e.childNodes.length).toBe(3);
+            child1 = e.childNodes[0];
+            textNode = e.childNodes[1];
+            child2 = e.childNodes[2];
           } else {
             // with Stack, there are five children: the child1 element, a single
             // space surrounded by react-text comments, and the child2 element.
@@ -1057,17 +1370,10 @@ describe('ReactDOMServerIntegration', () => {
           if (ReactDOMFeatureFlags.useFiber) {
             // with Fiber, there are three children: a one-space text node, the
             // child element, and a two-space text node.
-            if (render === serverRender) {
-              expect(e.childNodes.length).toBe(7);
-              textNode1 = e.childNodes[1];
-              child = e.childNodes[3];
-              textNode2 = e.childNodes[5];
-            } else {
-              expect(e.childNodes.length).toBe(3);
-              textNode1 = e.childNodes[0];
-              child = e.childNodes[1];
-              textNode2 = e.childNodes[2];
-            }
+            expect(e.childNodes.length).toBe(3);
+            textNode1 = e.childNodes[0];
+            child = e.childNodes[1];
+            textNode2 = e.childNodes[2];
           } else {
             // with Stack, there are 7 children: a one-space text node surrounded
             // by react-text comments, the child element, and a two-space text node
@@ -1099,10 +1405,14 @@ describe('ReactDOMServerIntegration', () => {
         );
         if (ReactDOMFeatureFlags.useFiber) {
           // with Fiber, there are just two text nodes.
-          if (render === serverRender) {
-            expect(e.childNodes.length).toBe(6);
-            expectTextNode(e.childNodes[1], '<span>Text1&quot;</span>');
-            expectTextNode(e.childNodes[4], '<span>Text2&quot;</span>');
+          if (
+            render === serverRender ||
+            render === clientRenderOnServerString ||
+            render === streamRender
+          ) {
+            expect(e.childNodes.length).toBe(3);
+            expectTextNode(e.childNodes[0], '<span>Text1&quot;</span>');
+            expectTextNode(e.childNodes[2], '<span>Text2&quot;</span>');
           } else {
             expect(e.childNodes.length).toBe(2);
             expectTextNode(e.childNodes[0], '<span>Text1&quot;</span>');
@@ -1119,26 +1429,81 @@ describe('ReactDOMServerIntegration', () => {
     });
 
     describe('components that throw errors', function() {
-      itThrowsWhenRendering('a string component', async render => {
-        const StringComponent = () => 'foo';
-        await render(<StringComponent />, 1);
-      });
+      itThrowsWhenRendering(
+        'a function returning undefined',
+        async render => {
+          const UndefinedComponent = () => undefined;
+          await render(<UndefinedComponent />, 1);
+        },
+        ReactDOMFeatureFlags.useFiber
+          ? 'UndefinedComponent(...): Nothing was returned from render. ' +
+              'This usually means a return statement is missing. Or, to ' +
+              'render nothing, return null.'
+          : 'A valid React element (or null) must be returned. ' +
+              'You may have returned undefined, an array or some other invalid object.',
+      );
 
-      itThrowsWhenRendering('an undefined component', async render => {
-        const UndefinedComponent = () => undefined;
-        await render(<UndefinedComponent />, 1);
-      });
+      itThrowsWhenRendering(
+        'a class returning undefined',
+        async render => {
+          class UndefinedComponent extends React.Component {
+            render() {
+              return undefined;
+            }
+          }
+          await render(<UndefinedComponent />, 1);
+        },
+        ReactDOMFeatureFlags.useFiber
+          ? 'UndefinedComponent(...): Nothing was returned from render. ' +
+              'This usually means a return statement is missing. Or, to ' +
+              'render nothing, return null.'
+          : 'A valid React element (or null) must be returned. ' +
+              'You may have returned undefined, an array or some other invalid object.',
+      );
 
-      itThrowsWhenRendering('a number component', async render => {
-        const NumberComponent = () => 54;
-        await render(<NumberComponent />, 1);
-      });
+      itThrowsWhenRendering(
+        'a function returning an object',
+        async render => {
+          const ObjectComponent = () => ({x: 123});
+          await render(<ObjectComponent />, 1);
+        },
+        ReactDOMFeatureFlags.useFiber
+          ? 'Objects are not valid as a React child (found: object with keys ' +
+              '{x}). If you meant to render a collection of children, use ' +
+              'an array instead.'
+          : 'A valid React element (or null) must be returned. ' +
+              'You may have returned undefined, an array or some other invalid object.',
+      );
 
-      itThrowsWhenRendering('null', render => render(null));
-      itThrowsWhenRendering('false', render => render(false));
-      itThrowsWhenRendering('undefined', render => render(undefined));
-      itThrowsWhenRendering('number', render => render(30));
-      itThrowsWhenRendering('string', render => render('foo'));
+      itThrowsWhenRendering(
+        'a class returning an object',
+        async render => {
+          class ObjectComponent extends React.Component {
+            render() {
+              return {x: 123};
+            }
+          }
+          await render(<ObjectComponent />, 1);
+        },
+        ReactDOMFeatureFlags.useFiber
+          ? 'Objects are not valid as a React child (found: object with keys ' +
+              '{x}). If you meant to render a collection of children, use ' +
+              'an array instead.'
+          : 'A valid React element (or null) must be returned. ' +
+              'You may have returned undefined, an array or some other invalid object.',
+      );
+
+      itThrowsWhenRendering(
+        'top-level object',
+        async render => {
+          await render({x: 123});
+        },
+        ReactDOMFeatureFlags.useFiber
+          ? 'Objects are not valid as a React child (found: object with keys ' +
+              '{x}). If you meant to render a collection of children, use ' +
+              'an array instead.'
+          : 'Invalid component element.',
+      );
     });
   });
 
@@ -1883,7 +2248,7 @@ describe('ReactDOMServerIntegration', () => {
     itThrowsWhenRendering(
       'if getChildContext exists without childContextTypes',
       render => {
-        class Component extends React.Component {
+        class MyComponent extends React.Component {
           render() {
             return <div />;
           }
@@ -1891,14 +2256,16 @@ describe('ReactDOMServerIntegration', () => {
             return {foo: 'bar'};
           }
         }
-        return render(<Component />);
+        return render(<MyComponent />);
       },
+      'MyComponent.getChildContext(): childContextTypes must be defined ' +
+        'in order to use getChildContext().',
     );
 
     itThrowsWhenRendering(
       'if getChildContext returns a value not in childContextTypes',
       render => {
-        class Component extends React.Component {
+        class MyComponent extends React.Component {
           render() {
             return <div />;
           }
@@ -1906,9 +2273,10 @@ describe('ReactDOMServerIntegration', () => {
             return {value1: 'foo', value2: 'bar'};
           }
         }
-        Component.childContextTypes = {value1: PropTypes.string};
-        return render(<Component />);
+        MyComponent.childContextTypes = {value1: PropTypes.string};
+        return render(<MyComponent />);
       },
+      'MyComponent.getChildContext(): key "value2" is not defined in childContextTypes.',
     );
   });
 
@@ -2044,6 +2412,44 @@ describe('ReactDOMServerIntegration', () => {
         expectMarkupMismatch(<div id="foo" />, <div id="bar" />));
     });
 
+    describe('inline styles', function() {
+      it('should error reconnecting missing style attribute', () =>
+        expectMarkupMismatch(<div style={{width: '1px'}} />, <div />));
+
+      it('should error reconnecting added style attribute', () =>
+        expectMarkupMismatch(<div />, <div style={{width: '1px'}} />));
+
+      it('should error reconnecting empty style attribute', () =>
+        expectMarkupMismatch(
+          <div style={{width: '1px'}} />,
+          <div style={{}} />,
+        ));
+
+      it('should error reconnecting added style values', () =>
+        expectMarkupMismatch(
+          <div style={{}} />,
+          <div style={{width: '1px'}} />,
+        ));
+
+      it('should error reconnecting different style values', () =>
+        expectMarkupMismatch(
+          <div style={{width: '1px'}} />,
+          <div style={{width: '2px'}} />,
+        ));
+
+      it('should reconnect number and string versions of a number', () =>
+        expectMarkupMatch(
+          <div style={{width: '1px', height: 2}} />,
+          <div style={{width: 1, height: '2px'}} />,
+        ));
+
+      it('should error reconnecting reordered style values', () =>
+        expectMarkupMismatch(
+          <div style={{width: '1px', fontSize: '2px'}} />,
+          <div style={{fontSize: '2px', width: '1px'}} />,
+        ));
+    });
+
     describe('text nodes', function() {
       it('should error reconnecting different text', () =>
         expectMarkupMismatch(<div>Text</div>, <div>Other Text</div>));
@@ -2111,7 +2517,12 @@ describe('ReactDOMServerIntegration', () => {
         ));
 
       it('can distinguish an empty component from an empty text component', () =>
-        expectMarkupMismatch(<div><EmptyComponent /></div>, <div>{''}</div>));
+        (ReactDOMFeatureFlags.useFiber
+          ? expectMarkupMatch
+          : expectMarkupMismatch)(
+          <div><EmptyComponent /></div>,
+          <div>{''}</div>,
+        ));
     });
 
     // Markup Mismatches: misc
@@ -2120,5 +2531,35 @@ describe('ReactDOMServerIntegration', () => {
         <div dangerouslySetInnerHTML={{__html: "<span id='child1'/>"}} />,
         <div dangerouslySetInnerHTML={{__html: "<span id='child2'/>"}} />,
       ));
+  });
+
+  describe('dynamic injection', () => {
+    beforeEach(() => {
+      // HACK: we reset modules several times during the test which breaks
+      // dynamic injection. So we resort to telling resetModules() to run
+      // our custom init code every time after resetting. We could have a nicer
+      // way to do this, but this is the only test that needs it, and it will
+      // be removed anyway when we switch to static injection.
+      onAfterResetModules = () => {
+        const DOMProperty = require('DOMProperty');
+        DOMProperty.injection.injectDOMPropertyConfig({
+          isCustomAttribute: function(name) {
+            return name.indexOf('foo-') === 0;
+          },
+          Properties: {foobar: null},
+        });
+      };
+      resetModules();
+    });
+
+    afterEach(() => {
+      onAfterResetModules = null;
+    });
+
+    itRenders('injected attributes', async render => {
+      const e = await render(<div foobar="simple" foo-xyz="simple" />, 0);
+      expect(e.getAttribute('foobar')).toBe('simple');
+      expect(e.getAttribute('foo-xyz')).toBe('simple');
+    });
   });
 });
