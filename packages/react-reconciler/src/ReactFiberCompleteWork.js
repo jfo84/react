@@ -712,6 +712,7 @@ function completeWork(
         // "stack" as the parent. Then append children as we go in beginWork
         // or completeWork depending on we want to add then top->down or
         // bottom->up. Top->down is faster in IE11.
+        console.log('workInProgress: ', workInProgress);
         let wasHydrated = popHydrationState(workInProgress);
         if (wasHydrated) {
           // TODO: Move this and createInstance step into the beginPhase
