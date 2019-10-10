@@ -11331,8 +11331,9 @@ function completeWork(current, workInProgress, renderExpirationTime) {
           // "stack" as the parent. Then append children as we go in beginWork
           // or completeWork depending on we want to add then top->down or
           // bottom->up. Top->down is faster in IE11.
+          // Get the stack
 
-          console.log('workInProgress: ', workInProgress);
+          warning$1(false, '');
 
           var _wasHydrated = popHydrationState(workInProgress);
 

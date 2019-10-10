@@ -61,6 +61,7 @@ import {
   Deletion,
 } from 'shared/ReactSideEffectTags';
 import invariant from 'shared/invariant';
+import warning from 'shared/warning';
 
 import {
   createInstance,
@@ -712,7 +713,8 @@ function completeWork(
         // "stack" as the parent. Then append children as we go in beginWork
         // or completeWork depending on we want to add then top->down or
         // bottom->up. Top->down is faster in IE11.
-        console.log('workInProgress: ', workInProgress);
+        // Get the stack
+        warning(false, '');
         let wasHydrated = popHydrationState(workInProgress);
         if (wasHydrated) {
           // TODO: Move this and createInstance step into the beginPhase
